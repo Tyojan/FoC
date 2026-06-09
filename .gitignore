@@ -1,1 +1,7 @@
 .venv/
+.foc-openssl/
+scripts/install_requirements.sh
+FoC-dataset.7z
+evaluate_model.py.test.json.pcode2comment_and_name.2026-06-08-21-15-51.json
+FoC-dataset/train.json
+FoC-dataset/test.json
