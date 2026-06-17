@@ -7,3 +7,6 @@ evaluate_model.py.test.json.pcode2comment_and_name.2026-06-08-21-15-51.json
 *.json
 *.pyc
 __pycache__/
+3731449.pdf
+FoC-Sim/models/
+FoC-Sim/cryptobench/
