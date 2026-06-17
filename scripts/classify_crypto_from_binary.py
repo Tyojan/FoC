@@ -519,7 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-functions", type=int, default=None, help="Maximum functions to extract from the binary")
     parser.add_argument("--include-thunks", action="store_true", help="Include thunk functions from Ghidra")
     parser.add_argument("--batch-size", type=int, default=32, help="FoC-Sim embedding batch size")
-    parser.add_argument("--binllm-batch-size", type=int, default=8, help="FoC-BinLLM generation batch size")
+    parser.add_argument("--binllm-batch-size", type=int, default=32, help="FoC-BinLLM generation batch size")
     parser.add_argument("--max-src-len", type=int, default=1024, help="FoC-BinLLM maximum input length")
     parser.add_argument("--max-tgt-len", type=int, default=256, help="FoC-BinLLM maximum generated length")
     parser.add_argument("--num-beams", type=int, default=1, help="FoC-BinLLM beam count")
