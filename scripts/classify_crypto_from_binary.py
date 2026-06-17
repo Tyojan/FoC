@@ -16,9 +16,11 @@ For the local environment in this repository, prefer:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import importlib.util
 import json
+import multiprocessing
 import os
 import pickle
 import shutil
@@ -495,11 +497,25 @@ def parse_args() -> argparse.Namespace:
         help="FoC-Sim opcode dictionary",
     )
     parser.add_argument("--ghidra-headless", default=None, help="Path to Ghidra analyzeHeadless")
-    parser.add_argument("--device", default=None, help="Torch device, e.g. cuda, cuda:0, cpu")
+    parser.add_argument("--device", default=None, help="Default Torch device for both models, e.g. cuda, cuda:0, cpu")
+    parser.add_argument("--sim-device", default=None, help="Torch device for FoC-Sim, e.g. cuda:0")
+    parser.add_argument("--binllm-device", default=None, help="Torch device for FoC-BinLLM, e.g. cuda:1")
+    parser.add_argument(
+        "--parallel-models",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Run FoC-Sim and FoC-BinLLM concurrently when they use different devices",
+    )
     parser.add_argument("--top-k", type=int, default=10, help="Number of nearest reference matches to output")
     parser.add_argument("--sim-threshold", type=float, default=0.80, help="FoC-Sim positive threshold")
     parser.add_argument("--include-modes", action="store_true", help="Treat block/AE mode keywords as reference positives")
+    parser.add_argument("--skip-sim", action="store_true", help="Skip FoC-Sim inference")
     parser.add_argument("--skip-binllm", action="store_true", help="Skip FoC-BinLLM explanation generation")
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Only run Ghidra extraction and stop before model inference",
+    )
     parser.add_argument("--max-functions", type=int, default=None, help="Maximum functions to extract from the binary")
     parser.add_argument("--include-thunks", action="store_true", help="Include thunk functions from Ghidra")
     parser.add_argument("--batch-size", type=int, default=32, help="FoC-Sim embedding batch size")
@@ -516,9 +532,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def require_python_packages(skip_binllm: bool) -> None:
-    required = ["numpy", "torch", "transformers", "scipy", "tqdm"]
-    missing = [pkg for pkg in required if importlib.util.find_spec(pkg) is None]
+def require_python_packages(skip_sim: bool, skip_binllm: bool, extract_only: bool) -> None:
+    required: List[str] = []
+    if not extract_only and not skip_sim:
+        required.extend(["numpy", "torch", "scipy", "tqdm"])
+    if not extract_only and not skip_binllm:
+        required.extend(["torch", "transformers", "tqdm"])
+    missing = sorted({pkg for pkg in required if importlib.util.find_spec(pkg) is None})
     if missing:
         raise SystemExit(
             "Missing Python packages: {0}. Run this with .venv/bin/python or install requirements.txt.".format(
@@ -740,6 +760,12 @@ def graph_sparse_string(n_blocks: int, edges: Sequence[Sequence[int]]) -> str:
     return sparse_string_from_entries(entries, n_blocks, n_blocks)
 
 
+def saturate_uint8_counter(value: int) -> int:
+    # FoC-Sim opcode features appear to come from byte-sized counters; keep
+    # query-side counts in the same bounded range instead of feeding raw totals.
+    return max(0, min(255, int(value)))
+
+
 def opcode_sparse_string(blocks: Sequence[Dict[str, Any]], arch: str, resources: Dict[str, Any]) -> str:
     n_blocks = max(1, len(blocks))
     opcodes: Dict[str, int] = resources["opcodes"]
@@ -775,6 +801,7 @@ def opcode_sparse_string(blocks: Sequence[Dict[str, Any]], arch: str, resources:
 
     if not entries:
         entries[(0, 196)] = 1
+    entries = {key: saturate_uint8_counter(value) for key, value in entries.items()}
     return sparse_string_from_entries(entries, n_blocks, 200)
 
 
@@ -1214,6 +1241,229 @@ def run_binllm_predictions(
     return results
 
 
+def cuda_device_count() -> int:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+    except Exception:
+        pass
+    return 0
+
+
+def normalize_device_name(device_arg: Optional[str]) -> Optional[str]:
+    if device_arg is None:
+        return None
+    lowered = str(device_arg).lower()
+    if lowered == "cuda":
+        return "cuda:0"
+    return lowered
+
+
+def pick_alternate_cuda_device(primary_device: str, device_count: int) -> str:
+    primary = normalize_device_name(primary_device)
+    for index in range(device_count):
+        candidate = "cuda:{0}".format(index)
+        if normalize_device_name(candidate) != primary:
+            return candidate
+    return primary_device
+
+
+def resolve_model_devices(args: argparse.Namespace) -> Tuple[str, Optional[str], bool]:
+    device_count = cuda_device_count()
+    if args.device:
+        default_device = args.device
+    else:
+        default_device = "cuda:0" if device_count > 0 else "cpu"
+
+    sim_device = args.sim_device or default_device
+    if args.skip_binllm:
+        return sim_device, None, False
+
+    if args.binllm_device:
+        binllm_device = args.binllm_device
+    elif args.device:
+        binllm_device = default_device
+    elif device_count >= 2:
+        binllm_device = pick_alternate_cuda_device(sim_device, device_count)
+    else:
+        binllm_device = default_device
+
+    same_device = normalize_device_name(sim_device) == normalize_device_name(binllm_device)
+    if args.parallel_models == "off":
+        parallel = False
+    elif args.parallel_models == "on":
+        if same_device:
+            raise SystemExit("--parallel-models on requires different --sim-device and --binllm-device values")
+        parallel = True
+    else:
+        parallel = not same_device
+
+    return sim_device, binllm_device, parallel
+
+
+def run_sim_predictions(
+    items: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+    device_arg: str,
+) -> List[Dict[str, Any]]:
+    import torch
+
+    checkpoint_path = resolve_existing_file(args.sim_checkpoint, "FoC-Sim checkpoint")
+    semantic_model_path = resolve_existing_dir(args.semantic_model, "semantic model directory")
+    reference_csv = resolve_existing_file(args.reference_csv, "reference CSV")
+    reference_features = resolve_existing_file(args.reference_features, "reference feature JSON")
+    opcodes_path = resolve_existing_file(args.opcodes_dict, "opcode dictionary")
+    reference_index = Path(args.reference_index).expanduser().resolve()
+    resources = load_feature_resources(opcodes_path)
+
+    device = select_device(device_arg)
+    print("[+] running FoC-Sim on device: {0}".format(device))
+    sim_model = load_focsim_model(checkpoint_path, semantic_model_path, device)
+    try:
+        index = load_or_build_reference_index(
+            args,
+            sim_model,
+            device,
+            resources,
+            reference_csv,
+            reference_features,
+            reference_index,
+        )
+        query_embeddings = embed_feature_items(sim_model, items, device, args.batch_size)
+        return classify_embeddings(query_embeddings, index, args)
+    finally:
+        del sim_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def run_skipped_sim_predictions(items: Sequence[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "crypto_label": False,
+            "sim_score": None,
+            "best_positive_match": None,
+            "top_matches": [],
+            "decision_reason": reason,
+        }
+        for _item in items
+    ]
+
+
+def write_worker_items(items: Sequence[Dict[str, Any]]) -> str:
+    fd, path = tempfile.mkstemp(prefix="focsim_model_items_", suffix=".pkl")
+    os.close(fd)
+    with open(path, "wb") as handle:
+        pickle.dump(list(items), handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return path
+
+
+def read_worker_items(path: str) -> List[Dict[str, Any]]:
+    with open(path, "rb") as handle:
+        return pickle.load(handle)
+
+
+def run_sim_predictions_worker(
+    items_path: str,
+    args_dict: Dict[str, Any],
+    device_arg: str,
+) -> List[Dict[str, Any]]:
+    return run_sim_predictions(read_worker_items(items_path), argparse.Namespace(**args_dict), device_arg)
+
+
+def run_binllm_predictions_worker(
+    items_path: str,
+    args_dict: Dict[str, Any],
+    device_arg: str,
+) -> List[Dict[str, Any]]:
+    args = argparse.Namespace(**args_dict)
+    return run_binllm_predictions(read_worker_items(items_path), args, select_device(device_arg))
+
+
+def run_parallel_model_predictions(
+    items: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+    sim_device: str,
+    binllm_device: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    print("[+] running FoC-Sim and FoC-BinLLM in parallel: sim={0}, binllm={1}".format(sim_device, binllm_device))
+    items_path = write_worker_items(items)
+    args_dict = vars(args).copy()
+    context = multiprocessing.get_context("spawn")
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=2, mp_context=context) as executor:
+            sim_future = executor.submit(run_sim_predictions_worker, items_path, args_dict, sim_device)
+            binllm_future = executor.submit(run_binllm_predictions_worker, items_path, args_dict, binllm_device)
+            sim_results = sim_future.result()
+            llm_results = binllm_future.result()
+            return sim_results, llm_results
+    finally:
+        try:
+            os.unlink(items_path)
+        except OSError:
+            pass
+
+
+def run_model_predictions(
+    items: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    if args.extract_only:
+        execution = {
+            "parallel": False,
+            "sim_device": None,
+            "binllm_device": None,
+            "skip_sim": True,
+            "skip_binllm": True,
+            "extract_only": True,
+        }
+        return run_skipped_sim_predictions(items, "foc_sim_skipped: extract-only mode"), run_binllm_predictions(
+            items, args, None
+        ), execution
+
+    if args.skip_sim:
+        resolved_binllm_device = None if args.skip_binllm else str(select_device(args.binllm_device))
+        execution = {
+            "parallel": False,
+            "sim_device": None,
+            "binllm_device": resolved_binllm_device,
+            "skip_sim": True,
+            "skip_binllm": bool(args.skip_binllm),
+            "extract_only": False,
+        }
+        sim_results = run_skipped_sim_predictions(items, "foc_sim_skipped: --skip-sim was set")
+        if args.skip_binllm:
+            llm_results = run_binllm_predictions(items, args, None)
+        else:
+            llm_results = run_binllm_predictions(items, args, select_device(args.binllm_device))
+        return sim_results, llm_results, execution
+
+    sim_device, binllm_device, parallel = resolve_model_devices(args)
+    execution = {
+        "parallel": parallel,
+        "sim_device": sim_device,
+        "binllm_device": None if args.skip_binllm else binllm_device,
+        "skip_sim": False,
+        "skip_binllm": bool(args.skip_binllm),
+        "extract_only": False,
+    }
+
+    if parallel and binllm_device is not None:
+        sim_results, llm_results = run_parallel_model_predictions(items, args, sim_device, binllm_device)
+        return sim_results, llm_results, execution
+
+    print("[+] running model inference sequentially")
+    sim_results = run_sim_predictions(items, args, sim_device)
+    if args.skip_binllm:
+        llm_results = run_binllm_predictions(items, args, None)
+    else:
+        assert binllm_device is not None
+        llm_results = run_binllm_predictions(items, args, select_device(binllm_device))
+    return sim_results, llm_results, execution
+
+
 def select_device(device_arg: Optional[str]) -> Any:
     import torch
 
@@ -1223,7 +1473,6 @@ def select_device(device_arg: Optional[str]) -> Any:
 
 
 def run_self_test() -> None:
-    require_python_packages(skip_binllm=True)
     opcodes_path = resolve_existing_file(str(FOC_SIM_DIR / "cryptobench" / "GCN" / "opcodes_dict.json"), "opcode dictionary")
     resources = load_feature_resources(opcodes_path)
     raw = {
@@ -1259,45 +1508,20 @@ def main() -> None:
         return
     if not args.binary:
         raise SystemExit("binary is required unless --self-test is used")
+    if args.extract_only:
+        args.skip_sim = True
+        args.skip_binllm = True
 
-    require_python_packages(skip_binllm=args.skip_binllm)
+    require_python_packages(skip_sim=args.skip_sim, skip_binllm=args.skip_binllm, extract_only=args.extract_only)
     binary_path = resolve_existing_file(args.binary, "input binary")
-    checkpoint_path = resolve_existing_file(args.sim_checkpoint, "FoC-Sim checkpoint")
-    semantic_model_path = resolve_existing_dir(args.semantic_model, "semantic model directory")
-    reference_csv = resolve_existing_file(args.reference_csv, "reference CSV")
-    reference_features = resolve_existing_file(args.reference_features, "reference feature JSON")
     opcodes_path = resolve_existing_file(args.opcodes_dict, "opcode dictionary")
     reference_index = Path(args.reference_index).expanduser().resolve()
 
     resources = load_feature_resources(opcodes_path)
     raw_records = run_ghidra_extractor(args, binary_path)
     feature_items = [raw_function_to_feature_item(raw, resources) for raw in raw_records]
-
-    device = select_device(args.device)
-    print("[+] using device: {0}".format(device))
-    sim_model = load_focsim_model(checkpoint_path, semantic_model_path, device)
-    index = load_or_build_reference_index(
-        args,
-        sim_model,
-        device,
-        resources,
-        reference_csv,
-        reference_features,
-        reference_index,
-    )
-    query_embeddings = embed_feature_items(sim_model, feature_items, device, args.batch_size)
-    sim_results = classify_embeddings(query_embeddings, index, args)
-
-    del sim_model
-    try:
-        import torch
-
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    llm_results = run_binllm_predictions(feature_items, args, device)
+    sim_results, llm_results, model_execution = run_model_predictions(feature_items, args)
+    feature_tail_labels = ["unique_callee_count", "callee_count", "edge_count", "block_count"]
 
     functions: List[Dict[str, Any]] = []
     for raw, item, sim_result, llm_result in zip(raw_records, feature_items, sim_results, llm_results):
@@ -1320,6 +1544,7 @@ def main() -> None:
                 "bit": item["bit"],
                 "blocks": len(raw.get("blocks") or []),
                 "edges": len(raw.get("edges") or []),
+                "feature_tail": [int(value) for value in item["feature"][-4:]],
             }
         )
 
@@ -1327,7 +1552,12 @@ def main() -> None:
         "binary": str(binary_path),
         "sim_threshold": args.sim_threshold,
         "include_modes": args.include_modes,
+        "skip_sim": bool(args.skip_sim),
+        "skip_binllm": bool(args.skip_binllm),
+        "extract_only": bool(args.extract_only),
         "reference_index": str(reference_index),
+        "model_execution": model_execution,
+        "feature_tail_labels": feature_tail_labels,
         "function_count": len(functions),
         "crypto_function_count": sum(1 for item in functions if item["crypto_label"]),
         "functions": functions,
