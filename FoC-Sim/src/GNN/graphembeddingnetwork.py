@@ -302,7 +302,7 @@ class GraphPropLayer(nn.Module):
             node_state_inputs = torch.unsqueeze(node_state_inputs, 0)
             node_states = torch.unsqueeze(node_states, 0)
             _, new_node_states = self.GRU(node_state_inputs, node_states)
-            new_node_states = torch.squeeze(new_node_states)
+            new_node_states = torch.squeeze(new_node_states, 0)
             return new_node_states
         else:
             mlp_output = self.MLP(node_state_inputs)
